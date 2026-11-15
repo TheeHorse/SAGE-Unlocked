@@ -1381,6 +1381,7 @@ static class Program
         Func<uint, byte[]> u = BitConverter.GetBytes;
         uint eng = mem + 0x3C, r = mem + 0x38, now3 = mem + 0x80, t0 = mem + 0x84, pend = mem + 0x88, k200 = mem + 0x8C;
         uint stubA = code + 0x800, stubB = code + 0xA00, table = mem + 0xB0, tickFrame = mem + 0xC8, prevNow = mem + 0xCC, prevA = mem + 0xD0;
+        uint held = mem + 0xD4;   // the network held the tick back at least once before it started
         // phase k is due once
         int T = site.Tick * 99 / 100;
         for (int k = 1; k <= 6; k++) Write(proc, table + (uint)((k - 1) * 4), BitConverter.GetBytes(k * T / 6 - 3));   // 30 63 97 130 163 197 at 15 hz
@@ -1415,8 +1416,20 @@ static class Program
         a.E(0x8B, 0x4E, ph);                                         // ecx = phase
         a.E(0x83, 0x3D); a.D(pend); a.E(0x00); a.J(0x74, "nopend");  // started a tick last frame?
         a.E(0xC7, 0x05); a.D(pend); a.D(0);
-        a.E(0x83, 0xF9, 0x06); a.J(0x72, "nopend");                 // wrapped = it started
+        a.E(0x83, 0xF9, 0x06); a.J(0x72, "started");                // wrapped = it started
         a.E(0x81, 0x2D); a.D(t0); a.D((uint)T);                      // network held it back, undo
+        a.E(0xC7, 0x05); a.D(held); a.D(1);                          // remember that
+        a.J(0xEB, "nopend");
+        a.L("started");
+        // Multiplayer: the network decides when a tick starts, not this clock. Without this the schedule ran
+        // behind the real start, so all six phases ran in the first frames of a tick and the drawn interpolation hit 1.0
+        // early: everything moved for ~70 ms and then stood still for the rest of the 200 ms tick. When a held-back tick
+        // finally starts, restart the schedule from the frame that started it (last frame's time = phase 1).
+        a.E(0x83, 0x3D); a.D(held); a.E(0x00); a.J(0x74, "nopend");
+        a.E(0xC7, 0x05); a.D(held); a.D(0);
+        a.E(0x8B, 0x15); a.D(prevA);                                 // edx = last frame's now3
+        a.E(0x81, 0xEA); a.D((uint)(T / 6 - 3));                     // phase 1 sits at T/6 - 3 on the timetable
+        a.E(0x89, 0x15); a.D(t0);                                    // tickStart = that
         a.L("nopend");
         a.E(0x8B, 0xD0, 0x2B, 0x15); a.D(t0);                        // edx = t = now3 - tickStart
         a.E(0x50, 0x2B, 0x05); a.D(prevA);                           // push eax / eax = frame length
