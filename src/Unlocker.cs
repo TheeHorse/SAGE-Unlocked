@@ -1372,11 +1372,15 @@ static class Program
         s.FfGlobal = hits[0].Item1; s.FfOff = hits[0].Item2;
     }
 
-    static void PatchScheduler(IntPtr proc, byte[] img, SchedSite site, uint fpsVa, uint mem, bool batches = false, uint frameClock = 0, int fps = 0)
+    // code: where the stubs go; mem: where the variables they write every frame live. Kept on separate pages
+    // when the caller passes a code base: under the FEX x86 emulator a stub that stores to its own code page gets part of
+    // itself executed twice (the clock came out as timeGetTime*9 instead of *3, so the game ran 3x too fast).
+    static void PatchScheduler(IntPtr proc, byte[] img, SchedSite site, uint fpsVa, uint mem, bool batches = false, uint frameClock = 0, int fps = 0, uint code = 0)
     {
+        if (code == 0) code = mem;
         Func<uint, byte[]> u = BitConverter.GetBytes;
         uint eng = mem + 0x3C, r = mem + 0x38, now3 = mem + 0x80, t0 = mem + 0x84, pend = mem + 0x88, k200 = mem + 0x8C;
-        uint stubA = mem + 0x800, stubB = mem + 0xA00, table = mem + 0xB0, tickFrame = mem + 0xC8, prevNow = mem + 0xCC, prevA = mem + 0xD0;
+        uint stubA = code + 0x800, stubB = code + 0xA00, table = mem + 0xB0, tickFrame = mem + 0xC8, prevNow = mem + 0xCC, prevA = mem + 0xD0;
         // phase k is due once
         int T = site.Tick * 99 / 100;
         for (int k = 1; k <= 6; k++) Write(proc, table + (uint)((k - 1) * 4), BitConverter.GetBytes(k * T / 6 - 3));   // 30 63 97 130 163 197 at 15 hz
@@ -1460,7 +1464,7 @@ static class Program
         realClockFn = 0;
         if (realclockOpt && On("realclock") && site.TimeFn != 0)
         {
-            uint fn = mem + 0x1080, rbase = mem + 0x1040;
+            uint fn = code + 0x1080, rbase = mem + 0x1040;
             var rc = new Asm(fn);
             rc.E(0x51, 0x52); rc.Rel(0xE8, site.TimeFn);                          // push ecx / push edx / eax = ms
             rc.E(0x8B, 0x0D); rc.D(rbase); rc.E(0x85, 0xC9); rc.J(0x75, "have");    // first call: base = now
@@ -1490,7 +1494,7 @@ static class Program
         {
             // #30: now3 is read when the frame starts
             uint lastT0 = mem + 0x1770, ibase = mem + 0x1774, w0 = mem + 0x1778, r0 = mem + 0x177C, rem = mem + 0x1600;   // rem: PatchClock
-            uint fi = mem + 0x1780;
+            uint fi = code + 0x1780;
             var f = new Asm(fi);
             f.E(0xA1); f.D(now3); f.E(0xA3); f.D(prevNow);                   // prevNow = now3 (kept up to date)
             f.E(0xA1); f.D(t0); f.E(0x3B, 0x05); f.D(lastT0); f.J(0x74, "same");
@@ -2604,6 +2608,7 @@ static class Program
         IntPtr mem = Alloc(proc, 0x2000);   // the shared scheduler keeps tables at +1000h and up
         if (mem == IntPtr.Zero) throw new Exception("couldn't allocate patch memory");
         uint m = (uint)mem;
+        uint data = (uint)AllocData(proc, 0x1000); if (data == 0) data = m;   // run-time scratch, off the code page
         patchMem = m; patchMemSize = 0x2000; memWrites.Clear(); memOverlaps.Clear();
         Write(proc, m, BitConverter.GetBytes(fps));
         foreach (var r in b.Restore) Write(proc, r.Item1, r.Item2);
@@ -2631,7 +2636,7 @@ static class Program
         // spell store update at most every 33 ms
         if (b.StoreJmp != 0 && On("spellstore") && fps > 30)
         {
-            uint stub = m + 0xE00, last = m + 0xE80;
+            uint stub = m + 0xE00, last = data + 0xE80;
             var a = new Asm(stub);
             a.E(0x51);                                   // push ecx (the store)
             a.E(0xFF, 0x15); a.D(b.TimeIat);             // call [timeGetTime]
@@ -2647,14 +2652,15 @@ static class Program
             var p = new List<byte> { 0xE9 }; p.AddRange(BitConverter.GetBytes(stub - (b.StoreJmp + 5)));
             Write(proc, b.StoreJmp, p.ToArray());
         }
-        if (b.ScrollSlot != 0 && On("scroll") && fps > 30) PatchScrollBy(proc, b.ScrollSlot, b.ScrollFunc, fps, m + 0x4F0, m + 0x4F8, m + 0x3C0);
+        if (b.ScrollSlot != 0 && On("scroll") && fps > 30) PatchScrollBy(proc, b.ScrollSlot, b.ScrollFunc, fps, m + 0x4F0, data + 0x4F8, m + 0x3C0);
         if (sched)
         {
             // its clock is timeGetTime straight from the import table: jmp [iat]
             var t = new List<byte> { 0xFF, 0x25 }; t.AddRange(BitConverter.GetBytes(b.TimeIat));
             Write(proc, m + 0xF80, t.ToArray());
             b.Sched.TimeFn = m + 0xF80;
-            PatchScheduler(proc, img, b.Sched, m, m);
+            uint sdata = (uint)AllocData(proc, 0x2000); if (sdata == 0) sdata = m;   // scheduler variables off the code page
+            PatchScheduler(proc, img, b.Sched, m, sdata, code: m);
         }
         FlushCode(proc);
         Func<IEnumerable<uint>, string> hex = l => string.Join(" ", l.Where(a => a != 0).Select(a => "0x" + a.ToString("X")));
@@ -2797,6 +2803,15 @@ static class Program
     const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_EXECUTE_READWRITE = 0x40;
 
     // memory helpers
+    // Data that the patch stubs write at run time gets its own non-executable page. Under an x86
+    // emulator (FEX on ARM64) a write to a page that also holds translated code faults and makes the emulator
+    // throw that page's translations away; the scroll stub did that on every scrollBy call.
+    static IntPtr AllocData(IntPtr proc, int size)
+    {
+        const uint PAGE_READWRITE = 0x04;
+        return proc == IntPtr.Zero ? VirtualAlloc(IntPtr.Zero, (UIntPtr)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                                   : VirtualAllocEx(proc, IntPtr.Zero, (UIntPtr)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
     static IntPtr Alloc(IntPtr proc, int size)
     {
         return proc == IntPtr.Zero ? VirtualAlloc(IntPtr.Zero, (UIntPtr)size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
