@@ -1382,17 +1382,9 @@ static class Program
         uint eng = mem + 0x3C, r = mem + 0x38, now3 = mem + 0x80, t0 = mem + 0x84, pend = mem + 0x88, k200 = mem + 0x8C;
         uint stubA = code + 0x800, stubB = code + 0xA00, table = mem + 0xB0, tickFrame = mem + 0xC8, prevNow = mem + 0xCC, prevA = mem + 0xD0;
         uint held = mem + 0xD4;   // the network held the tick back at least once before it started
-        // BFME II (separate data page): the drawn interpolation runs evenly over the whole tick. The game latches
-        // each value at the first frame of a tick (phase 1) and draws base + interp * delta, so interp has to go
-        // frame/tick ... 1.0 from that frame on. It used to be measured from tickStart, which is a sixth of a tick before
-        // phase 1: it began at 1/6, hit 1.0 a sixth early and froze there (3-4 frames at 120 fps), then jumped: steady
-        // movers such as birds showed missing frames five times a second.
-        bool even = code != mem && !batches && frameClock == 0;
         uint nready = mem + 0xDC;   // ticks of the other players' data waiting, read at the top of stub A
-        uint tickBegin = mem + 0xD8, bnd = mem + 0xE0;   // time of the tick's first frame; k*T/6 for k = 0..6
         // phase k is due once
         int T = site.Tick * 99 / 100;
-        if (even) for (int k = 0; k <= 6; k++) Write(proc, bnd + (uint)(k * 4), BitConverter.GetBytes(k * T / 6));
         for (int k = 1; k <= 6; k++) Write(proc, table + (uint)((k - 1) * 4), BitConverter.GetBytes(k * T / 6 - 3));   // 30 63 97 130 163 197 at 15 hz
         // batches: phases 1-3 run together when the tick starts
         uint itable = table;
@@ -1473,7 +1465,6 @@ static class Program
             // runs at double speed until at most one tick is waiting: tickStart moves back by a frame length per frame.
             a.E(0x83, 0x3D); a.D(nready); a.E(0x01); a.J(0x7E, "level");
             a.E(0x29, 0x05); a.D(t0);                                // sub [tickStart],eax
-            if (even) { a.E(0x29, 0x05); a.D(tickBegin); }           // the interpolation keeps step
             a.E(0x03, 0xD0);                                         // t += frame length
             a.L("level");
         }
@@ -1566,22 +1557,13 @@ static class Program
         }
         else
         {
-            if (even)
-            {
-                // a tick started on this frame: stub A asked for it (pend) and the engine wrapped the phase to 1
-                b.E(0x83, 0x3D); b.D(pend); b.E(0x01); b.J(0x75, "nb");
-                b.E(0x83, 0x7E, ph, 0x01); b.J(0x75, "nb");
-                b.E(0xA1); b.D(now3); b.E(0xA3); b.D(tickBegin);
-                b.L("nb");
-            }
             b.E(0xA1); b.D(now3); b.E(0x8B, 0xD0, 0x2B, 0x15); b.D(prevNow);   // edx = frame length
             b.E(0xA3); b.D(prevNow);
             b.E(0x85, 0xD2); b.J(0x7D, "dpos"); b.E(0x33, 0xD2);
             b.L("dpos");
             b.E(0x83, 0xFA, 0x64); b.J(0x7E, "dok"); b.E(0xBA); b.D(100);         // clamp 0..100
             b.L("dok");
-            b.E(0x2B, 0x05); b.D(even ? tickBegin : t0); b.E(0x03, 0xC2);        // eax = now - tick start + frame length
-            if (even) itable = bnd;                                              // bounds (phase-1)/6 .. phase/6
+            b.E(0x2B, 0x05); b.D(t0); b.E(0x03, 0xC2);                           // eax = now - tickStart + frame length
         }
         b.E(0x85, 0xC0); b.J(0x7D, "b1"); b.E(0x33, 0xC0);
         b.L("b1");
