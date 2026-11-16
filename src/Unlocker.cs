@@ -1307,7 +1307,7 @@ static class Program
     }
 
     // each 15hz tick is 6 phases
-    class SchedSite { public uint Advance, Exit, TimeFn; public byte Phase, Interp; public uint Dispatch; public uint PreGlobal, PreFn; public byte PreOff; public int Tick = 200; public uint FfGlobal, FfOff; }   // Tick: logic tick in 1/3 ms (200 = 15 hz, 600 = 5 hz)
+    class SchedSite { public uint Advance, Exit, TimeFn; public byte Phase, Interp; public uint Dispatch; public uint PreGlobal, PreFn; public byte PreOff; public int Tick = 200; public uint FfGlobal, FfOff; public uint NetGlobal; public byte NetReadyOff; }   // Tick: logic tick in 1/3 ms (200 = 15 hz, 600 = 5 hz)
 
     const string SchedPatternA = "8B 0D ?? ?? ?? ?? BB 01 00 00 00 88 99 C4 00 00 00 8B 4E 58 83 F9 06 75 1A 80 7E 64 00 74 14 A1 ?? ?? ?? ?? 33 D2 F7 35";
     const string SchedPatternB = "8B 16 50 8B 82 90 00 00 00 8B CE FF D0 8B 0D ?? ?? ?? ?? 8B 11 8B 82 A0 00 00 00 5F 5E 5B 83 C4 04";
@@ -1388,6 +1388,7 @@ static class Program
         // phase 1: it began at 1/6, hit 1.0 a sixth early and froze there (3-4 frames at 120 fps), then jumped: steady
         // movers such as birds showed missing frames five times a second.
         bool even = code != mem && !batches && frameClock == 0;
+        uint nready = mem + 0xDC;   // ticks of the other players' data waiting, read at the top of stub A
         uint tickBegin = mem + 0xD8, bnd = mem + 0xE0;   // time of the tick's first frame; k*T/6 for k = 0..6
         // phase k is due once
         int T = site.Tick * 99 / 100;
@@ -1413,6 +1414,25 @@ static class Program
         a.E(0x89, 0x35); a.D(eng);                                   // mov [engine],esi
         if (newTickFlag != 0) { a.E(0xC6, 0x05); a.D(newTickFlag); a.E(0x00); }   // mov byte [newtick],0: a new engine update
         a.E(0x50, 0x52, 0x51);                                       // push eax / push edx / push ecx
+        // Network catch-up. A machine that has fallen behind the others (a hitch, a long load) has several ticks
+        // of their data waiting. The game then stops drawing, switches its frame limiter off and runs ticks back to back
+        // until it is level again. This timetable knew nothing of that: it kept handing out one tick per tick length, so
+        // the game spun through hundreds of thousands of empty updates per second between them, drew one frame per tick
+        // and never caught up (5 fps for minutes, until the other machine hitched in turn). While more than 3 ticks are
+        // waiting (the engine's own threshold) the original code runs untouched; the ">2 ticks behind" resync below
+        // picks the timetable up again afterwards.
+        if (site.NetGlobal != 0 && On("catchup"))
+        {
+            a.E(0xA1); a.D(site.NetGlobal);                          // mov eax,[TheNetwork]
+            a.E(0x85, 0xC0); a.J(0x74, "nonet");                     // not a network game
+            a.E(0x8B, 0xC8, 0x8B, 0x00);                             // mov ecx,eax / mov eax,[eax]
+            a.E(0xFF, 0x50, site.NetReadyOff);                       // call [eax+ready]
+            a.E(0x83, 0xF8, 0x03); a.J(0x7F, "pass");                // more than 3 waiting: behind, the game catches up by itself
+            a.E(0xA3); a.D(nready); a.J(0xEB, "haven");             // 0..3: remembered for the timetable below
+            a.L("nonet");
+            a.E(0xC7, 0x05); a.D(nready); a.D(0);
+            a.L("haven");
+        }
         // replay fast forward
         if (site.FfGlobal != 0) { a.E(0xA1); a.D(site.FfGlobal); a.E(0x85, 0xC0); a.J(0x74, "noff"); a.E(0x80, 0xB8); a.D(site.FfOff); a.E(0x00); a.J(0x75, "pass"); a.L("noff"); }
         a.E(0xA1); a.D(fpsVa); a.E(0x33, 0xD2, 0xB9, 0x0F, 0, 0, 0, 0xF7, 0xF1); a.E(0xA3); a.D(r);   // r = fps / 15
@@ -1446,6 +1466,17 @@ static class Program
         a.L("lpos");
         a.E(0x83, 0xF8, 0x64); a.J(0x7E, "lok"); a.E(0xB8); a.D(100);   // clamp 0..100
         a.L("lok");
+        if (site.NetGlobal != 0 && On("catchup"))
+        {
+            // 2 or 3 ticks waiting: still behind, but below the engine's own catch-up threshold. Left alone it only closes
+            // by the 1 % this timetable runs fast (a tick per 20 s). So the timetable
+            // runs at double speed until at most one tick is waiting: tickStart moves back by a frame length per frame.
+            a.E(0x83, 0x3D); a.D(nready); a.E(0x01); a.J(0x7E, "level");
+            a.E(0x29, 0x05); a.D(t0);                                // sub [tickStart],eax
+            if (even) { a.E(0x29, 0x05); a.D(tickBegin); }           // the interpolation keeps step
+            a.E(0x03, 0xD0);                                         // t += frame length
+            a.L("level");
+        }
         a.E(0x03, 0xD0, 0x58);                                       // edx = t + frame length / pop eax
         a.E(0x83, 0xF9, 0x06); a.J(0x72, "mid");
         // phase 6 done
@@ -2625,6 +2656,14 @@ static class Program
                 if (ex != 0 && disp != 0 && pre > adv && pre < adv + 0x40)
                     b.Sched = new SchedSite { Advance = adv, Exit = ex, Phase = phase, Interp = img[(int)(ip - ImageBase) + 24], Dispatch = disp, Tick = 3000 / 5,
                                               PreGlobal = BitConverter.ToUInt32(img, (int)(pre - ImageBase) + 2), PreOff = img[(int)(pre - ImageBase) + 8], PreFn = CallTarget(img, pre + 18) };
+                // the engine's own network catch-up check: push esi / mov esi,ecx / mov ecx,[TheNetwork] / test / je /
+                // movss xmm0,[1.0] / comiss xmm0,[net factor] / ja / mov eax,[esi+phase] / cmp eax,1 / je / cmp eax,[esi+framesPerTick] /
+                // mov eax,[ecx] / jle / call [eax+ready] ...   (ready = how many ticks of the other players' data are waiting)
+                if (b.Sched != null)
+                {
+                    uint nc = FindUnique(img, "56 8B F1 8B 0D ?? ?? ?? ?? 85 C9 74 ?? F3 0F 10 05 ?? ?? ?? ?? 0F 2F 05 ?? ?? ?? ?? 77 ?? 8B 46 ?? 83 F8 01 74 ?? 3B 46 ?? 8B 01 7E ?? FF 50");
+                    if (nc != 0) { b.Sched.NetGlobal = BitConverter.ToUInt32(img, (int)(nc - ImageBase) + 5); b.Sched.NetReadyOff = img[(int)(nc - ImageBase) + 47]; }
+                }
             }
         }
         return b;
@@ -2633,7 +2672,7 @@ static class Program
     static void ApplyPatchesBfme(IntPtr proc, byte[] img, int fps, BfmeSites b)
     {
         bool sched = b.Sched != null && On("sched");
-        found = "found: fps limiter" + (b.Sched != null ? " sched" : "") + (b.FrameMsSetter != 0 ? " animclock" : "") + (b.ScrollSlot != 0 ? " scroll" : "") + (b.SpellStore != 0 ? " spellstore" : "") +
+        found = "found: fps limiter" + (b.Sched != null ? " sched" : "") + (b.Sched != null && b.Sched.NetGlobal != 0 ? " catchup" : "") + (b.FrameMsSetter != 0 ? " animclock" : "") + (b.ScrollSlot != 0 ? " scroll" : "") + (b.SpellStore != 0 ? " spellstore" : "") +
                 " | missing:" + (b.Sched == null ? " sched" : "") + (b.FrameMsSetter == 0 ? " animclock" : "") + (b.ScrollSlot == 0 ? " scroll" : "") + (b.SpellStore == 0 ? " spellstore" : "");
         IntPtr mem = Alloc(proc, 0x2000);   // the shared scheduler keeps tables at +1000h and up
         if (mem == IntPtr.Zero) throw new Exception("couldn't allocate patch memory");
